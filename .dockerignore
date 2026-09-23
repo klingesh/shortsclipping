@@ -38,6 +38,20 @@ videos/
 # Model files (downloaded at build time)
 *.pt
 
+# Runtime caches. These are populated by the container at run time and reach it
+# through the compose bind mount, so they never belong in the build context.
+# Leaving them in also broke the Windows build outright: the HuggingFace cache
+# stores snapshots/ as links into blobs/, which the build context cannot
+# resolve, and the build died on
+#   invalid file request .cache/huggingface/hub/models--Systran--faster-whisper-small/...
+# while needlessly shipping ~477MB.
+.cache/
+.config/
+
+# Job artefacts and user uploads — bind-mounted by compose, not baked in.
+output/
+uploads/
+
 # Secrets — never bake real credentials into the image (repo is public,
 # image may be pushed to a registry). Runtime env comes via compose env_file.
 .env
