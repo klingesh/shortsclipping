@@ -229,28 +229,12 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
 SAFE_MARGIN_V = 43
 
 
-# The caption look applied automatically to every generated clip. Chosen by
-# rendering four candidates on a real clip and comparing them (25-jul-2026):
-# white Anton uppercase with a yellow active word, heavy black outline, gentle
-# pop. Yellow because it is the one colour that almost never occurs in footage,
-# so the active word reads instantly on any background; the base text stays
-# fully opaque (dimming it tested worse over bright scenes). This is a starting
-# point, not a cage — the subtitle modal still overrides every field.
-AUTO_CAPTION_STYLE = {
-    "style": "karaoke",
-    "alignment": "bottom",
-    "font_name": "Anton",
-    "font_size": 44,
-    "font_color": "#FFFFFF",
-    "highlight_color": "#FFE500",
-    "border_color": "#000000",
-    "border_width": 4,
-    "effect": "pop",
-    "base_opacity": 1.0,
-    "uppercase": True,
-    "max_chars": 16,
-    "max_duration": 1.4,
-}
+# The caption look applied automatically to every generated clip, and the rest
+# of the named looks, now live in caption_presets so the dashboard can fetch the
+# same table over /api/caption-presets instead of keeping a copy that drifts.
+# Re-exported here because main.auto_caption_clip and external callers import
+# the constant from this module.
+from caption_presets import AUTO_CAPTION_STYLE  # noqa: E402  (re-export)
 
 
 def _ass_time(seconds):
@@ -484,14 +468,23 @@ def _sanitize_font_name(name):
 def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
                    font_name="Verdana", font_color="#FFFFFF",
                    border_color="#000000", border_width=2,
-                   bg_color="#000000", bg_opacity=0.0):
+                   bg_color="#000000", bg_opacity=0.0,
+                   margin_v=SAFE_MARGIN_V):
     """
     Burns subtitles into the video using FFmpeg.
     Supports two modes:
     - Outline mode (bg_opacity=0): Text with colored outline/border
     - Box mode (bg_opacity>0): Text with semi-transparent background box
+
+    ``margin_v`` is the distance from the anchored edge in PlayResY=288 units,
+    the same scale generate_ass uses. It only affects the SRT path: an .ass file
+    carries its own MarginV and force_style is deliberately skipped for it.
     """
-    # Position mapping
+    # Position mapping. These are SSA legacy codes (6 = top, 10 = middle) rather
+    # than the ASS v4+ numpad codes generate_ass uses (8 = top, 5 = middle).
+    # libass accepts both here and places all three correctly — verified by
+    # measuring rendered pixels, see verify_placement.py — so this stays as is.
+    # Do not "correct" it to numpad codes without re-measuring.
     ass_alignment = 2
     align_lower = str(alignment).lower()
     if align_lower == 'top':
@@ -540,7 +533,7 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
         f"BorderStyle={border_style},"
         f"Outline={outline_width},"
         f"Shadow=0,"
-        f"MarginV={SAFE_MARGIN_V},"
+        f"MarginV={int(_clamp_number(margin_v, 0, 200, SAFE_MARGIN_V))},"
         f"Bold=1"
     )
 

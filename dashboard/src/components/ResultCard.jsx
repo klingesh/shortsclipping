@@ -437,6 +437,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 body: JSON.stringify({
                     job_id: jobId,
                     clip_index: index,
+                    // Named look. The explicit fields below still win, but this
+                    // is the only route to the preset's block grouping
+                    // (max_chars/max_duration), which has no request field.
+                    preset: options.preset || null,
                     position: options.position,
                     font_size: options.fontSize,
                     font_name: options.fontName,
@@ -450,6 +454,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     effect: options.effect || 'none',
                     base_opacity: options.baseOpacity ?? 1.0,
                     uppercase: options.uppercase || false,
+                    // Offset from the anchored edge in ASS PlayResY=288 units,
+                    // same scale as font_size. 43 = subtitles.SAFE_MARGIN_V.
+                    margin_v: options.marginV ?? 43,
                     input_filename: serverVideoFile,
                     // Edited caption text (clip-relative ms); null = server
                     // regenerates from the transcript as before.

@@ -15,10 +15,39 @@ interface SubtitlesProps {
   config: SubtitleConfig;
 }
 
+// Fallbacks for when no explicit offset is supplied. The burn measures its
+// offset in ASS PlayResY=288 units, so these percentages are only ever
+// approximations of it; prefer config.marginV, which converts exactly.
 const POSITION_MAP: Record<string, React.CSSProperties> = {
   top: { top: "12%", bottom: "auto" },
   middle: { top: "45%", bottom: "auto" },
   bottom: { bottom: "10%", top: "auto" },
+};
+
+// libass measures MarginV against a virtual 288px-tall frame, regardless of the
+// real resolution (subtitles.generate_ass sets PlayResY=288).
+const ASS_PLAY_RES_Y = 288;
+
+/**
+ * Turn the burn's MarginV into CSS for the preview.
+ *
+ * Without this the preview showed captions at a fixed 10% from the bottom while
+ * the export placed them wherever MarginV said, so moving the caption in the
+ * editor changed the output but not the preview.
+ *
+ * ASS ignores MarginV for a middle anchor, so middle keeps the fixed position.
+ */
+const offsetStyle = (
+  position: string,
+  marginV: number | undefined,
+): React.CSSProperties => {
+  if (typeof marginV !== "number" || position === "middle") {
+    return POSITION_MAP[position] ?? POSITION_MAP.bottom;
+  }
+  const percent = `${(marginV / ASS_PLAY_RES_Y) * 100}%`;
+  return position === "top"
+    ? { top: percent, bottom: "auto" }
+    : { bottom: percent, top: "auto" };
 };
 
 export const Subtitles: React.FC<SubtitlesProps> = ({ config }) => {
@@ -66,13 +95,13 @@ const SubtitleBlock: React.FC<SubtitleBlockProps> = ({
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const { style, position } = config;
+  const { style, position, marginV } = config;
 
   // Current time relative to composition start (sequence-relative frame)
   const currentTimeMs = blockStartMs + (frame / fps) * 1000;
   const activeIndex = getActiveWordIndex(block.words, currentTimeMs);
 
-  const positionStyle = POSITION_MAP[position] ?? POSITION_MAP.bottom;
+  const positionStyle = offsetStyle(position, marginV);
   const fontStack = getFontStack(style.fontFamily);
 
   // Background box style

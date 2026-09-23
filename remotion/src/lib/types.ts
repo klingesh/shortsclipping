@@ -21,12 +21,24 @@ export interface SubtitleStyle {
   bgColor: string;
   bgOpacity: number;
   animation: SubtitleAnimation;
+  // Karaoke look: dim inactive words (0.05-1) and force uppercase. Both are
+  // part of every caption preset the backend burns, so omitting them here made
+  // this tree unable to reproduce the burned look at all.
+  baseOpacity?: number;
+  uppercase?: boolean;
 }
 
 export interface SubtitleConfig {
   captions: CaptionWord[];
   position: SubtitlePosition;
   style: SubtitleStyle;
+  /**
+   * Offset from the edge named by `position`, in ASS PlayResY=288 units — the
+   * same scale the burn uses (subtitles.SAFE_MARGIN_V is 43). Omit to fall back
+   * to fixed percentages. Ignored for `middle`, which ASS renders without
+   * regard to MarginV.
+   */
+  marginV?: number;
 }
 
 // --- Hook config ---
@@ -96,12 +108,20 @@ export const subtitleStyleSchema = z.object({
   bgColor: z.string(),
   bgOpacity: z.number().min(0).max(1),
   animation: z.enum(["none", "word-highlight", "pop", "karaoke"]),
+  // Optional so existing callers keep validating. The 0.05 floor mirrors the
+  // Python clamp in subtitles._dim_hex_color; a true 0 would render invisible
+  // inactive words rather than dimmed ones.
+  baseOpacity: z.number().min(0.05).max(1).optional(),
+  uppercase: z.boolean().optional(),
 });
 
 export const subtitleConfigSchema = z.object({
   captions: z.array(captionWordSchema),
   position: z.enum(["top", "middle", "bottom"]),
   style: subtitleStyleSchema,
+  // Both generators clamp MarginV to 0..200, so reject anything outside that
+  // rather than letting the burn silently substitute a different value.
+  marginV: z.number().min(0).max(200).optional(),
 });
 
 export const hookConfigSchema = z.object({

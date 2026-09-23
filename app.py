@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import recut
 import layout_ranges
+import caption_presets
 
 load_dotenv()
 
@@ -3174,6 +3175,11 @@ class CaptionWordIn(BaseModel):
 class SubtitleRequest(BaseModel):
     job_id: str
     clip_index: int
+    # Named look from caption_presets. When set it supplies every style field,
+    # and any field the caller ALSO sent explicitly overrides it — so "pick a
+    # preset, then nudge one colour" works. The flat defaults below only apply
+    # when no preset is named, which keeps older clients byte-identical.
+    preset: Optional[str] = None
     position: str = "bottom" # top, middle, bottom
     font_size: int = 16
     font_name: str = "Verdana"
@@ -3187,11 +3193,105 @@ class SubtitleRequest(BaseModel):
     effect: str = "none"  # none | glow | pop | box (karaoke only)
     base_opacity: float = 1.0  # opacity of non-active words (dimmed modern look)
     uppercase: bool = False
+    # Distance from the `position` edge in PlayResY=288 units, same scale as
+    # font_size. Defaults to subtitles.SAFE_MARGIN_V, which clears the platform
+    # UI. Together with `position` this gives free-form vertical placement.
+    margin_v: int = 43
     input_filename: Optional[str] = None
     # User-edited caption words. When present, the burn uses them VERBATIM
     # instead of regenerating from the stored transcript — without this, text
     # edits in the modal were silently discarded on the server render path.
     words: Optional[List[CaptionWordIn]] = None
+
+
+# Maps caption_presets style keys onto SubtitleRequest field names. The two
+# differ because the preset table speaks generate_ass's language (`alignment`,
+# `font_size`) while the request speaks the modal's (`position`, `font_size`).
+_PRESET_TO_REQUEST_FIELD = {
+    "alignment": "position",
+    "style": "style",
+    "font_name": "font_name",
+    "font_size": "font_size",
+    "font_color": "font_color",
+    "highlight_color": "highlight_color",
+    "border_color": "border_color",
+    "border_width": "border_width",
+    "bg_color": "bg_color",
+    "bg_opacity": "bg_opacity",
+    "effect": "effect",
+    "base_opacity": "base_opacity",
+    "uppercase": "uppercase",
+    "margin_v": "margin_v",
+}
+
+
+def _resolved_caption_style(req: "SubtitleRequest") -> dict:
+    """Merge a named preset with whatever the caller set explicitly.
+
+    Returns a dict keyed the way generate_ass wants, including the block
+    grouping (`max_chars`, `max_duration`) that presets carry but the request
+    model has never exposed — that pair is what makes the one-word-at-a-time
+    streamer looks possible at all.
+    """
+    if not req.preset:
+        # No preset: behave exactly as before, and keep the grouping defaults
+        # the ASS generator has always used for ad-hoc restyles.
+        return {
+            "alignment": req.position, "style": req.style,
+            "fontsize": req.font_size, "font_name": req.font_name,
+            "font_color": req.font_color, "highlight_color": req.highlight_color,
+            "border_color": req.border_color, "border_width": req.border_width,
+            "bg_color": req.bg_color, "bg_opacity": req.bg_opacity,
+            "effect": req.effect, "base_opacity": req.base_opacity,
+            "uppercase": req.uppercase, "margin_v": req.margin_v,
+            "max_chars": 20, "max_duration": 2.0,
+        }
+
+    preset_style = caption_presets.resolve(req.preset)
+    # Pydantic v2 tells us which fields actually arrived on the wire, which is
+    # the only way to distinguish "caller wants white" from "caller said
+    # nothing and the model defaulted to white".
+    explicit = req.model_fields_set
+
+    merged = {}
+    for preset_key, request_field in _PRESET_TO_REQUEST_FIELD.items():
+        if request_field in explicit:
+            merged[preset_key] = getattr(req, request_field)
+        else:
+            merged[preset_key] = preset_style[preset_key]
+
+    return {
+        "alignment": merged["alignment"], "style": merged["style"],
+        "fontsize": merged["font_size"], "font_name": merged["font_name"],
+        "font_color": merged["font_color"],
+        "highlight_color": merged["highlight_color"],
+        "border_color": merged["border_color"],
+        "border_width": merged["border_width"],
+        "bg_color": merged["bg_color"], "bg_opacity": merged["bg_opacity"],
+        "effect": merged["effect"], "base_opacity": merged["base_opacity"],
+        "uppercase": merged["uppercase"], "margin_v": merged["margin_v"],
+        # Grouping is preset-only: there is no request field to override it.
+        "max_chars": preset_style["max_chars"],
+        "max_duration": preset_style["max_duration"],
+    }
+
+
+@app.get("/api/caption-presets")
+async def get_caption_presets():
+    """The named caption looks, with each one's fully resolved style.
+
+    The dashboard fetches this instead of carrying its own table. A client-side
+    copy could disagree with what the server burns, and the Remotion preview
+    would then show a look the export never produces.
+    """
+    return {
+        "presets": caption_presets.catalog(),
+        "default": caption_presets.DEFAULT_PRESET_ID,
+        # Served from the same place for the same reason: a client-side font list
+        # can offer a family the image cannot resolve, and libass falls back to
+        # DejaVu without telling anyone.
+        "fonts": caption_presets.font_catalog(),
+    }
 
 
 @app.get("/api/clip/{job_id}/{clip_index}/transcript")
@@ -4166,7 +4266,12 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
 
     # Define outputs
     generation_id = int(time.time())
-    is_karaoke = req.style == "karaoke"
+    # Resolve the named preset (if any) against the caller's explicit fields
+    # BEFORE deciding karaoke vs classic: a preset carries `style` too, so
+    # reading req.style here would ignore the preset's choice and pick the
+    # wrong generator and file extension.
+    resolved_style = _resolved_caption_style(req)
+    is_karaoke = resolved_style["style"] == "karaoke"
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
 
@@ -4178,11 +4283,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         clip_data.get('layout_ranges') or layout_ranges.read(input_path))
     karaoke_opts = dict(
         split_ranges=seam_ranges,
-        alignment=req.position, fontsize=req.font_size, font_name=req.font_name,
-        font_color=req.font_color, border_color=req.border_color,
-        border_width=req.border_width, highlight_color=req.highlight_color,
-        bg_color=req.bg_color, bg_opacity=req.bg_opacity,
-        effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
+        **{k: v for k, v in resolved_style.items() if k != "style"},
     )
 
     # Output video
@@ -4231,11 +4332,21 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
         # 2. Burn Subtitles
         # Run in thread pool
         def run_burn():
+             # Must read the RESOLVED style, not req.*: on the classic SRT path
+             # these values become libass force_style and are the only thing
+             # that styles the burn, so a preset would otherwise be ignored
+             # entirely. (On the .ass path force_style is deliberately skipped
+             # and the look is already baked into the file.)
              burn_subtitles(input_path, srt_path, output_path,
-                           alignment=req.position, fontsize=req.font_size,
-                           font_name=req.font_name, font_color=req.font_color,
-                           border_color=req.border_color, border_width=req.border_width,
-                           bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+                           alignment=resolved_style["alignment"],
+                           fontsize=resolved_style["fontsize"],
+                           font_name=resolved_style["font_name"],
+                           font_color=resolved_style["font_color"],
+                           border_color=resolved_style["border_color"],
+                           border_width=resolved_style["border_width"],
+                           bg_color=resolved_style["bg_color"],
+                           bg_opacity=resolved_style["bg_opacity"],
+                           margin_v=resolved_style["margin_v"])
         
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)

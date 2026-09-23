@@ -5,14 +5,12 @@ import RemotionPreview from './RemotionPreview';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 
-const FONT_OPTIONS = [
-    { value: 'Verdana', label: 'Verdana' },
-    { value: 'Arial', label: 'Arial' },
-    { value: 'Impact', label: 'Impact' },
-    { value: 'Helvetica', label: 'Helvetica' },
-    { value: 'Georgia', label: 'Georgia' },
-    { value: 'Courier New', label: 'Courier New' },
-];
+// Fonts come from GET /api/caption-presets alongside the presets. As a hardcoded
+// array here, nothing could check that an offered family was one the image can
+// actually resolve — libass falls back to DejaVu silently (issue #57), so a bad
+// entry would look right in this preview and wrong in the export. The server now
+// owns the list and a test asserts every entry resolves.
+const FONT_FALLBACK = [{ value: 'Anton', label: 'Anton' }];
 
 const COLOR_PRESETS = [
     { color: '#FFFFFF', label: 'White' },
@@ -44,21 +42,41 @@ const POSITION_OPTIONS = [
     { value: 'bottom', label: 'bottom' },
 ];
 
-// Ready-made caption looks burned server-side as karaoke ASS (word highlight):
-// dimmed base text + strong active word, optional glow/pop/box effect.
-const CAPTION_PRESETS = [
-    { id: 'tiktok',  label: 'TikTok',     style: 'karaoke', effect: 'none', highlightColor: '#FE2C55', baseOpacity: 0.75, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'reels',   label: 'Reels',      style: 'karaoke', effect: 'none', highlightColor: '#E1306C', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'shorts',  label: 'Shorts Pop', style: 'karaoke', effect: 'pop',  highlightColor: '#FF0000', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'gold',    label: 'Gold Glow',  style: 'karaoke', effect: 'glow', highlightColor: '#FFD700', baseOpacity: 0.6,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'neon',    label: 'Neon',       style: 'karaoke', effect: 'glow', highlightColor: '#00FF88', baseOpacity: 0.55, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'cyber',   label: 'Cyber',      style: 'karaoke', effect: 'glow', highlightColor: '#00FFFF', baseOpacity: 0.5,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'karaoke', label: 'Karaoke',    style: 'karaoke', effect: 'none', highlightColor: '#FF6B6B', baseOpacity: 0.6,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'minimal', label: 'Minimal',    style: 'karaoke', effect: 'none', highlightColor: '#FFFFFF', baseOpacity: 0.65, uppercase: false, fontName: 'Verdana', borderWidth: 1 },
-    { id: 'beast',   label: 'Beast',      style: 'karaoke', effect: 'pop',  highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: true,  fontName: 'Impact',  borderWidth: 3 },
-    { id: 'boxed',   label: 'Boxed',      style: 'karaoke', effect: 'box',  highlightColor: '#7C3AED', baseOpacity: 0.85, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'classic', label: 'Classic',    style: 'classic', effect: 'none', highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-];
+// Caption presets are fetched from GET /api/caption-presets, which serves the
+// same table caption_presets.py burns from. They used to be hardcoded here, and
+// the copy could disagree with the server — the preview then advertised a look
+// the export never produced.
+const PREVIEW_HEIGHT = 1920;
+
+// The ASS generator measures font size in PlayResY=288 units and then scales by
+// 0.85 (subtitles.generate_ass). The Remotion preview measures in CSS pixels on
+// a 1080x1920 canvas. Converting between them is the only way the preview can
+// show the size that actually gets burned: the previous hardcoded `* 2.2` fudge
+// rendered the default 44 at ~53px instead of ~249px, roughly five times small.
+const ASS_PLAY_RES_Y = 288;
+const ASS_FONTSIZE_SCALE = 0.85;
+
+// generate_ass clamps fontsize to 10..200; staying inside that range means the
+// slider can never ask for a size the burn will quietly change.
+const ASS_FONTSIZE_MIN = 16;
+const ASS_FONTSIZE_MAX = 90;
+
+// MarginV is clamped 0..200 by both generators. 220 measured as the point where
+// a bottom-anchored caption reaches the upper third, so 200 is ample.
+const ASS_MARGIN_MIN = 0;
+const ASS_MARGIN_MAX = 200;
+
+const assSizeToPreviewPx = (assFontSize, canvasHeight = PREVIEW_HEIGHT) =>
+    Math.round((assFontSize * ASS_FONTSIZE_SCALE / ASS_PLAY_RES_Y) * canvasHeight);
+
+// Where the caption sits in the preview, as a fraction of frame height, so the
+// Remotion overlay lands where libass will put it. MarginV measures to the text
+// edge nearest the anchor, not its centre.
+const marginToPreviewFraction = (marginV, anchor) => {
+    const offset = marginV / ASS_PLAY_RES_Y;
+    if (anchor === 'top') return offset;
+    return 1 - offset;
+};
 
 const swatchClass = (selected) =>
     `w-6 h-6 rounded-full transition-all ${selected
@@ -67,7 +85,11 @@ const swatchClass = (selected) =>
 
 export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
     const [position, setPosition] = useState('bottom');
-    const [fontSize] = useState(24);
+    // ASS units (PlayResY=288), matching what the server burns — not pixels.
+    // Was a frozen useState(24) with no setter, so a preset's size was ignored.
+    const [fontSize, setFontSize] = useState(44);
+    // Offset from the anchored edge, also in ASS units. 43 = SAFE_MARGIN_V.
+    const [marginV, setMarginV] = useState(43);
     const [fontName, setFontName] = useState('Verdana');
     const [fontColor, setFontColor] = useState('#FFFFFF');
     const [highlightColor, setHighlightColor] = useState('#FFDD00');
@@ -84,20 +106,49 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [baseOpacity, setBaseOpacity] = useState(1.0);
     const [uppercase, setUppercase] = useState(false);
     const [activePreset, setActivePreset] = useState(null);
+    const [presets, setPresets] = useState([]);
+    const [fontOptions, setFontOptions] = useState(FONT_FALLBACK);
 
+    // One fetch per mount. The server owns both tables; this component only
+    // renders them and mirrors the chosen preset into the individual controls so
+    // the user can keep nudging from there.
+    useEffect(() => {
+        let cancelled = false;
+        apiFetch('/api/caption-presets')
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) => {
+                if (cancelled || !data) return;
+                if (Array.isArray(data.presets)) setPresets(data.presets);
+                if (Array.isArray(data.fonts) && data.fonts.length > 0) {
+                    setFontOptions(data.fonts.map((f) => ({
+                        value: f.family, label: f.label || f.family, group: f.group,
+                    })));
+                }
+            })
+            .catch(() => { /* preset grid stays empty; manual controls still work */ });
+        return () => { cancelled = true; };
+    }, []);
+
+    // `p` is a server entry: { id, label, group, style: { ...snake_case } }.
     const applyPreset = (p) => {
+        const s = p.style || {};
         setActivePreset(p.id);
-        setStyle(p.style);
-        setEffect(p.effect);
-        setHighlightColor(p.highlightColor);
-        setBaseOpacity(p.baseOpacity);
-        setUppercase(p.uppercase);
-        setFontName(p.fontName);
-        setBorderWidth(p.borderWidth);
-        setFontColor('#FFFFFF');
-        setBgOpacity(0);
+        setStyle(s.style);
+        setEffect(s.effect);
+        setPosition(s.alignment);
+        setFontName(s.font_name);
+        setFontSize(s.font_size);
+        setFontColor(s.font_color);
+        setHighlightColor(s.highlight_color);
+        setBorderColor(s.border_color);
+        setBorderWidth(s.border_width);
+        setBgColor(s.bg_color);
+        setBgOpacity(s.bg_opacity);
+        setBaseOpacity(s.base_opacity);
+        setUppercase(s.uppercase);
+        if (typeof s.margin_v === 'number') setMarginV(s.margin_v);
         // Keep the Remotion preview roughly in sync with the burned look
-        setAnimation(p.style === 'karaoke' ? (p.effect === 'pop' ? 'pop' : p.effect === 'glow' ? 'word-highlight' : 'karaoke') : 'none');
+        setAnimation(s.style === 'karaoke' ? (s.effect === 'pop' ? 'pop' : s.effect === 'glow' ? 'word-highlight' : 'karaoke') : 'none');
     };
 
     // Remotion preview state
@@ -158,9 +209,14 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const subtitleConfig = {
         captions,
         position,
+        // Same ASS units the burn uses, so the preview moves with the slider
+        // instead of sitting at a fixed percentage.
+        marginV,
         style: {
             fontFamily: fontName,
-            fontSize: fontSize * 2.2, // Scale up for 1080p (modal fontSize is for small preview)
+            // Convert ASS units to preview pixels rather than guessing at a
+            // multiplier, so the preview matches the burn at every size.
+            fontSize: assSizeToPreviewPx(fontSize),
             fontColor,
             highlightColor,
             borderColor,
@@ -243,7 +299,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                         <div>
                             <p className="eyebrow mb-2">Preset</p>
                             <div className="grid grid-cols-3 gap-1.5">
-                                {CAPTION_PRESETS.map((p) => (
+                                {presets.map((p) => (
                                     <button
                                         key={p.id}
                                         onClick={() => applyPreset(p)}
@@ -253,7 +309,13 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                                 : 'border-rule2 text-muted hover:border-[color:var(--color-accent)]'}`}
                                         title={p.label}
                                     >
-                                        <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: p.highlightColor }} />
+                                        {/* Swatch shows the colour the word actually reads as: for the
+                                            one-word looks that is font_color, since there is no inactive
+                                            text for a highlight to contrast against. */}
+                                        <span
+                                            className="w-2 h-2 rounded-full shrink-0"
+                                            style={{ backgroundColor: p.style?.max_chars === 1 ? p.style?.font_color : p.style?.highlight_color }}
+                                        />
                                         {p.label}
                                     </button>
                                 ))}
@@ -285,6 +347,28 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             )}
                         </div>
 
+                        {/* Size. Stored in ASS units to match the burn; shown as
+                            a share of frame height, which is the only number
+                            that means anything across resolutions. */}
+                        <div>
+                            <div className="flex items-center justify-between mb-2">
+                                <p className="eyebrow">Size</p>
+                                <span className="readout">
+                                    {(assSizeToPreviewPx(fontSize) / PREVIEW_HEIGHT * 100).toFixed(1)}% of height
+                                </span>
+                            </div>
+                            <input
+                                type="range"
+                                min={ASS_FONTSIZE_MIN}
+                                max={ASS_FONTSIZE_MAX}
+                                step={1}
+                                value={fontSize}
+                                onChange={(e) => setFontSize(Number(e.target.value))}
+                                className="w-full"
+                                aria-label="Caption size"
+                            />
+                        </div>
+
                         {/* Position Selector */}
                         <div>
                             <p className="eyebrow mb-2">Position</p>
@@ -294,6 +378,33 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                 onChange={setPosition}
                                 size="sm"
                             />
+                            {/* Free-form offset from whichever edge Position
+                                anchored to. ASS ignores MarginV for a middle
+                                anchor, so the slider is only meaningful for top
+                                and bottom and is hidden otherwise rather than
+                                sitting there doing nothing. */}
+                            {position !== 'middle' && (
+                                <div className="mt-3">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <span className="readout">
+                                            offset from {position}
+                                        </span>
+                                        <span className="readout">
+                                            {(marginV / ASS_PLAY_RES_Y * 100).toFixed(0)}%
+                                        </span>
+                                    </div>
+                                    <input
+                                        type="range"
+                                        min={ASS_MARGIN_MIN}
+                                        max={ASS_MARGIN_MAX}
+                                        step={1}
+                                        value={marginV}
+                                        onChange={(e) => setMarginV(Number(e.target.value))}
+                                        className="w-full"
+                                        aria-label={`Caption offset from ${position}`}
+                                    />
+                                </div>
+                            )}
                         </div>
 
                         {/* Animation Style (new) */}
@@ -339,7 +450,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                 onChange={(e) => setFontName(e.target.value)}
                                 className="input-field"
                             >
-                                {FONT_OPTIONS.map((f) => (
+                                {fontOptions.map((f) => (
                                     <option key={f.value} value={f.value} style={{ fontFamily: f.value }}>{f.label}</option>
                                 ))}
                             </select>
@@ -452,7 +563,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             const styleOptions = {
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
                                 // Karaoke burn (server-side ASS render)
-                                style, effect, baseOpacity, uppercase, highlightColor,
+                                style, effect, baseOpacity, uppercase, highlightColor, marginV,
+                                // The individual fields above already carry the preset's values,
+                                // so the id is not redundant for styling — it is how the server
+                                // reaches max_chars/max_duration, which have no request field and
+                                // are what produce the one-word-per-screen streamer looks.
+                                preset: activePreset,
                                 // Remotion data
                                 remotion: useRemotionPreview ? subtitleConfig : null,
                                 captions: textEdited ? captions : null,
