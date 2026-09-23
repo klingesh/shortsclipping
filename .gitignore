@@ -46,3 +46,9 @@ skills-lock.json
 # Cloud env example kept local only (avoid leaking infra hints)
 .env.cloud.example
 .worktrees
+
+# Session marker written into the repo root as ":memory:.ses" when the suite
+# imports the cloud database layer. A colon is an illegal filename character on
+# Windows, so leaving it untracked lets it confuse Windows tooling and risks it
+# being committed by a `git add .`.
+*.ses
