@@ -18,3 +18,11 @@ python-multipart==0.0.27
 httpx==0.28.1
 Pillow==12.2.0
 beautifulsoup4==4.14.3
+
+# Local text-to-speech (tts_backends.py). Kokoro-82M has Apache-licensed
+# weights and runs on CPU at roughly 0.6x realtime, so script-driven voiceover
+# costs nothing per generation and works offline. Needs the espeak-ng apt
+# package above: misaki falls back to it for out-of-dictionary words.
+# soundfile writes the 24 kHz float32 output that Kokoro returns.
+kokoro==0.9.4
+soundfile==0.14.0

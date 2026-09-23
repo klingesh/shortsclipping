@@ -782,37 +782,31 @@ def generate_voiceover(
     output_path: str,
     voice_id: str = "21m00Tcm4TlvDq8ikWAM",
 ) -> str:
-    """Generate voiceover audio using ElevenLabs TTS."""
-    print(f"[SaaSShorts] 🎙️ Generating voiceover ({len(text)} chars)...")
+    """Generate voiceover audio through the configured TTS backend.
 
-    url = f"{ELEVENLABS_API_BASE}/text-to-speech/{voice_id}"
+    The signature is unchanged so existing callers and their retry/cache logic
+    keep working, but the ElevenLabs call now lives in tts_backends. Which
+    backend runs is decided by TTS_BACKEND (default kokoro, local and free);
+    ``elevenlabs_key`` is only consulted when that backend is selected.
 
-    headers = {
-        "xi-api-key": elevenlabs_key,
-        "Content-Type": "application/json",
-    }
+    A voice id belongs to one backend, so a leftover ElevenLabs id is ignored
+    rather than passed to Kokoro, which would reject it.
+    """
+    import tts_backends
 
-    body = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-            "style": 0.4,
-            "use_speaker_boost": True,
-        },
-    }
+    backend = tts_backends.active()
+    voice = voice_id
+    if backend == "kokoro" and voice not in tts_backends._KOKORO_VOICE_IDS:
+        voice = tts_backends.KOKORO_DEFAULT_VOICE
+    elif backend == "elevenlabs" and not voice:
+        voice = tts_backends.ELEVENLABS_DEFAULT_VOICE
 
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(url, headers=headers, json=body)
-        if resp.status_code != 200:
-            raise Exception(f"ElevenLabs TTS error ({resp.status_code}): {resp.text}")
-
-        with open(output_path, "wb") as f:
-            f.write(resp.content)
-
-    print(f"[SaaSShorts] ✅ Voiceover: {output_path}")
-    return output_path
+    print(f"[SaaSShorts] 🎙️ Generating voiceover ({len(text)} chars, "
+          f"{backend}/{voice})...")
+    result = tts_backends.synthesize(
+        text, output_path, voice=voice, backend=backend, api_key=elevenlabs_key)
+    print(f"[SaaSShorts] ✅ Voiceover: {result['path']}")
+    return result["path"]
 
 
 def get_elevenlabs_voices(elevenlabs_key: str) -> list:
