@@ -32,6 +32,8 @@ from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3
 import recut
 import layout_ranges
 import caption_presets
+import tts_backends
+import voiceover
 
 load_dotenv()
 
@@ -492,7 +494,12 @@ def _canonical_clip_file(output_dir, base_name, index):
         derived = (glob.glob(os.path.join(output_dir, f"subtitled_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"recut_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hooked_*_{clean}"))
-                   + glob.glob(os.path.join(output_dir, f"hook_{clean}")))
+                   + glob.glob(os.path.join(output_dir, f"hook_{clean}"))
+                   # voiced_ is the script-driven voiceover pass. It needs its
+                   # own entry for the uncaptioned case; a recaptioned one
+                   # already matches subtitled_*_ above, the same way captioned
+                   # recuts do.
+                   + glob.glob(os.path.join(output_dir, f"voiced_*_{clean}")))
     except Exception:
         derived = []
     if not derived:
@@ -4391,6 +4398,230 @@ class RemoveSubtitlesRequest(BaseModel):
     job_id: str
     clip_index: int
     input_filename: Optional[str] = None
+
+
+class VoiceoverRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    # The narration script. Not a transcript of the clip — this is what the
+    # creator wants said over it.
+    script: str
+    voice: Optional[str] = None
+    # Defaults to TTS_BACKEND (kokoro: local, free, no key).
+    backend: Optional[str] = None
+    mode: str = "replace"          # replace | mix (keep the clip's own audio under)
+    voice_volume: float = 1.0
+    original_volume: float = 0.15  # only used by mix
+    music: Optional[str] = None    # bare filename from /api/voiceover/music
+    music_volume: float = 0.10
+    # Re-burn captions from the NARRATION rather than the clip's own speech.
+    # On by default: a voiceover whose captions still track the original audio
+    # is worse than no captions.
+    recaption: bool = True
+    preset: Optional[str] = None
+    input_filename: Optional[str] = None
+
+
+@app.get("/api/voiceover/music")
+async def list_voiceover_music():
+    """Music beds available as a background layer."""
+    return {"music": voiceover.music_catalog(), "dir": voiceover.music_dir()}
+
+
+@app.get("/api/voiceover/voices")
+async def list_voiceover_voices(backend: Optional[str] = None):
+    """Voices for the active (or requested) TTS backend."""
+    chosen = backend or tts_backends.active()
+    return {
+        "backend": chosen,
+        "available": tts_backends.is_available(chosen),
+        "default": tts_backends.default_voice(chosen),
+        "voices": tts_backends.voice_catalog(chosen),
+    }
+
+
+@app.post("/api/voiceover")
+async def add_voiceover(req: VoiceoverRequest, request: Request):
+    """Speak ``script`` over a clip, and re-sync its captions to the narration.
+
+    Audio only: the video stream is copied, so this is not a re-render and costs
+    no quality. The clip's length is unchanged, which keeps its hook gating and
+    layout ranges valid.
+
+    Captions are re-derived by transcribing the generated speech rather than from
+    the script text, because the script carries no timings. That also keeps the
+    feature independent of which TTS engine ran.
+    """
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    script = (req.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="Script is empty.")
+    if len(script) > 5000:
+        # Narration far longer than any short-form clip is a scripting mistake,
+        # and on a paid backend it is a bill. Refuse rather than generate it.
+        raise HTTPException(
+            status_code=400,
+            detail="Script is too long (max 5000 characters).")
+    if req.mode not in voiceover.MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mode must be one of {list(voiceover.MODES)}")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip_data = clips[req.clip_index]
+
+    filename = os.path.basename(
+        req.input_filename
+        or (clip_data.get('video_url') or '').split('/')[-1])
+    if not filename:
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+
+    # Work from the clean file. Muxing onto an already-captioned copy would keep
+    # the OLD captions burned into the picture while the audio says something
+    # else, and captions must stay the last layer.
+    filename = _strip_burned_captions(output_dir, filename)
+    input_path = os.path.join(output_dir, filename)
+    if not os.path.exists(input_path):
+        raise HTTPException(
+            status_code=404, detail=f"Video file not found: {filename}")
+
+    try:
+        music_path = voiceover.resolve_music(req.music)
+    except voiceover.VoiceoverError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    generation_id = int(time.time())
+    # Neutral, apostrophe-free name: this path is interpolated into an ffmpeg
+    # filter by the caption pass that follows, where a quote breaks the filter.
+    narration_path = os.path.join(
+        output_dir, f"narration_{generation_id}_{uuid.uuid4().hex[:8]}.wav")
+    voiced_name = f"voiced_{generation_id}_{filename}"
+    voiced_path = os.path.join(output_dir, voiced_name)
+
+    loop = asyncio.get_event_loop()
+    try:
+        def run_tts():
+            return tts_backends.synthesize(
+                script, narration_path, voice=req.voice, backend=req.backend,
+                api_key=request.headers.get("X-ElevenLabs-Key"))
+
+        tts_result = await loop.run_in_executor(None, run_tts)
+
+        def run_mux():
+            return voiceover.apply_voiceover(
+                input_path, narration_path, voiced_path,
+                mode=req.mode, voice_volume=req.voice_volume,
+                original_volume=req.original_volume,
+                music_path=music_path, music_volume=req.music_volume)
+
+        report = await loop.run_in_executor(None, run_mux)
+    except tts_backends.TTSUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except voiceover.VoiceoverError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    final_name = voiced_name
+    caption_error = None
+    if req.recaption:
+        try:
+            def run_recaption():
+                transcript = voiceover.narration_transcript(
+                    narration_path, clip_duration=report["video_duration"])
+                if not transcript.get("segments"):
+                    return None
+                style = caption_presets.resolve(
+                    req.preset or caption_presets.DEFAULT_PRESET_ID)
+                ass_path = os.path.join(
+                    output_dir,
+                    f"vosubs_{generation_id}_{uuid.uuid4().hex[:8]}.ass")
+                seam = layout_ranges.split_ranges(
+                    clip_data.get('layout_ranges')
+                    or layout_ranges.read(voiced_path))
+                ok = generate_ass(
+                    transcript, 0, report["video_duration"], ass_path,
+                    split_ranges=seam,
+                    max_chars=style["max_chars"],
+                    max_duration=style["max_duration"],
+                    alignment=style["alignment"], fontsize=style["font_size"],
+                    font_name=style["font_name"],
+                    font_color=style["font_color"],
+                    border_color=style["border_color"],
+                    border_width=style["border_width"],
+                    highlight_color=style["highlight_color"],
+                    bg_color=style["bg_color"], bg_opacity=style["bg_opacity"],
+                    effect=style["effect"],
+                    base_opacity=style["base_opacity"],
+                    uppercase=style["uppercase"], margin_v=style["margin_v"])
+                if not ok:
+                    return None
+                out_name = f"subtitled_{generation_id}_{voiced_name}"
+                burn_subtitles(
+                    voiced_path, ass_path,
+                    os.path.join(output_dir, out_name),
+                    alignment=style["alignment"], fontsize=style["font_size"],
+                    font_name=style["font_name"],
+                    font_color=style["font_color"],
+                    border_color=style["border_color"],
+                    border_width=style["border_width"],
+                    bg_color=style["bg_color"], bg_opacity=style["bg_opacity"],
+                    margin_v=style["margin_v"])
+                return out_name
+
+            recaptioned = await loop.run_in_executor(None, run_recaption)
+            if recaptioned:
+                final_name = recaptioned
+        except Exception as exc:
+            # Fail open, matching auto_caption_clip: the voiceover already
+            # succeeded and is worth delivering without captions.
+            caption_error = f"{type(exc).__name__}: {exc}"
+            print(f"⚠️ Voiceover captions failed ({caption_error}) — "
+                  f"delivering the voiced clip without them.")
+
+    video_url = f"/videos/{req.job_id}/{final_name}"
+    if req.clip_index < len(job.get('result', {}).get('clips', [])):
+        job['result']['clips'][req.clip_index]['video_url'] = video_url
+    try:
+        clips[req.clip_index]['video_url'] = video_url
+        clips[req.clip_index]['voiceover'] = {
+            "script": script,
+            "backend": tts_result["backend"],
+            "voice": tts_result["voice"],
+            "mode": report["mode"],
+            "music": report["music"],
+            "generated_at": generation_id,
+        }
+        data['shorts'] = clips
+        with open(json_files[0], 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as exc:
+        print(f"⚠️ Failed to update metadata.json after voiceover: {exc}")
+
+    _archive_clip_edit_bg(req.job_id, req.clip_index, final_name)
+
+    return {
+        "success": True,
+        "new_video_url": video_url,
+        "backend": tts_result["backend"],
+        "voice": tts_result["voice"],
+        "recaptioned": final_name != voiced_name,
+        "caption_error": caption_error,
+        **{k: v for k, v in report.items() if k != "output"},
+    }
 
 
 @app.post("/api/subtitle/remove")
