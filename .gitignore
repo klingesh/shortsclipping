@@ -52,3 +52,9 @@ skills-lock.json
 # Windows, so leaving it untracked lets it confuse Windows tooling and risks it
 # being committed by a `git add .`.
 *.ses
+
+# Per-clip sidecars (layout_ranges, subject_track). These live next to their
+# clip, normally under the ignored output/, but a verification run against a
+# clip in the repo root leaves one behind.
+*.layout.json
+*.track.json
