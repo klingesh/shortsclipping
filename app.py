@@ -36,6 +36,7 @@ import tts_backends
 import voiceover
 import annotations
 import subject_track
+import username_mark
 
 load_dotenv()
 
@@ -502,7 +503,11 @@ def _canonical_clip_file(output_dir, base_name, index):
                    # uncaptioned case; a recaptioned one already matches
                    # subtitled_*_ above, the same way captioned recuts do.
                    + glob.glob(os.path.join(output_dir, f"voiced_*_{clean}"))
-                   + glob.glob(os.path.join(output_dir, f"annotated_*_{clean}")))
+                   + glob.glob(os.path.join(output_dir, f"annotated_*_{clean}"))
+                   # marked_ is the creator's own username watermark. Omitting
+                   # it here is the failure this list exists to prevent: the
+                   # clip silently reverts to an unmarked version on restore.
+                   + glob.glob(os.path.join(output_dir, f"marked_*_{clean}")))
     except Exception:
         derived = []
     if not derived:
@@ -577,6 +582,20 @@ def _strip_annotations(output_dir, filename):
     """
     while True:
         m = re.match(r'^annotated_\d+_(.+)$', filename)
+        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
+            return filename
+        filename = m.group(1)
+
+
+def _strip_mark(output_dir, filename):
+    """Walk ``marked_<ts>_`` prefixes back to the file without the username mark.
+
+    Restyling the handle has to replace the old one, not print a second copy
+    over it. Same fail-safe contract as _strip_burned_captions: the name comes
+    back unchanged when there is nothing to strip or the underlying file is gone.
+    """
+    while True:
+        m = re.match(r'^marked_\d+_(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
             return filename
         filename = m.group(1)
@@ -4930,6 +4949,212 @@ async def remove_annotations(req: RemoveSubtitlesRequest, request: Request):
     if req.clip_index < len(mem_clips):
         mem_clips[req.clip_index]['video_url'] = video_url
         mem_clips[req.clip_index]['annotations'] = None
+
+    return {"success": True, "new_video_url": video_url}
+
+
+class WatermarkRequest(BaseModel):
+    """The creator's own handle. Distinct from the OpenShorts free-plan mark,
+    which main.apply_watermark burns in place and which this cannot touch."""
+    job_id: str
+    clip_index: int
+    text: str
+    font: Optional[str] = None
+    size: Optional[float] = None
+    color: Optional[str] = None
+    opacity: Optional[float] = None
+    outline_width: Optional[float] = None
+    outline_color: Optional[str] = None
+    anchor: Optional[str] = None
+    margin: Optional[float] = None
+    # Free placement, overriding the anchor. None is meaningful here and is not
+    # the same as 0.0, so these cannot be given numeric defaults.
+    x: Optional[float] = None
+    y: Optional[float] = None
+    start: Optional[float] = None
+    end: Optional[float] = None
+    recaption: bool = True
+    input_filename: Optional[str] = None
+
+
+@app.get("/api/watermark/options")
+async def watermark_options():
+    """Fonts, anchors, defaults and limits for the watermark control.
+
+    Served rather than duplicated in the dashboard for the reason issue #57
+    exists: a font offered in the UI that the image cannot resolve renders as
+    something else with no error anywhere.
+    """
+    return username_mark.catalog()
+
+
+@app.post("/api/watermark")
+async def add_watermark(req: WatermarkRequest, request: Request):
+    """Burn the creator's handle onto a clip.
+
+    A derived ``marked_<ts>_`` file with the original kept beside it, so the
+    handle can be restyled or removed. That is the opposite of
+    main.apply_watermark, which stamps OpenShorts' own mark in place at a
+    position chosen to be expensive to crop — appropriate for branding a free
+    export, hostile for someone's own name.
+    """
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip_data = clips[req.clip_index]
+
+    filename = os.path.basename(
+        req.input_filename
+        or (clip_data.get('video_url') or '').split('/')[-1])
+    if not filename:
+        base = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        filename = f"{base}_clip_{req.clip_index + 1}.mp4"
+
+    # Captions come off first so a marked+captioned clip resolves, then the old
+    # mark, so restyling replaces it instead of printing a second handle over
+    # the first.
+    filename = _strip_burned_captions(output_dir, filename)
+    filename = _strip_mark(output_dir, filename)
+    input_path = os.path.join(output_dir, filename)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404,
+                            detail=f"Video file not found: {filename}")
+
+    spec = {k: v for k, v in req.model_dump(
+        exclude_none=True,
+        exclude={"job_id", "clip_index", "recaption", "input_filename"}).items()}
+    try:
+        normalised = username_mark.normalise_mark(spec)
+    except username_mark.MarkError as exc:
+        # A 400, not a 500: every one of these is something about the request.
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    generation_id = int(time.time())
+    marked_name = f"marked_{generation_id}_{filename}"
+    marked_path = os.path.join(output_dir, marked_name)
+
+    loop = asyncio.get_event_loop()
+    try:
+        report = await loop.run_in_executor(
+            None,
+            lambda: username_mark.apply_mark(input_path, normalised,
+                                             marked_path, workdir=output_dir))
+    except username_mark.MarkError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    final_name = marked_name
+    caption_error = None
+    if req.recaption:
+        # Captions stay the last layer, the same invariant the annotation and
+        # recut paths keep. The handle sits low in the frame and the captions in
+        # the middle, so in practice they do not fight; making an exception here
+        # would mean two different layer orders in one pipeline.
+        try:
+            captioned = await loop.run_in_executor(
+                None,
+                lambda: _reapply_captions(req.job_id, req.clip_index,
+                                          marked_path))
+            if captioned:
+                final_name = os.path.basename(captioned)
+        except Exception as exc:
+            caption_error = f"{type(exc).__name__}: {exc}"
+            print(f"⚠️ Watermark captions failed ({caption_error}) — "
+                  f"delivering the marked clip without them.")
+
+    video_url = f"/videos/{req.job_id}/{final_name}"
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    if req.clip_index < len(mem_clips):
+        mem_clips[req.clip_index]['video_url'] = video_url
+        mem_clips[req.clip_index]['watermark'] = normalised
+    try:
+        # A sibling of `recipe`, never inside it: both the rerender and the
+        # reframe path build a fresh recipe dict, so anything stored in there is
+        # dropped on the next edit with no error.
+        clip_data['video_url'] = video_url
+        clip_data['watermark'] = normalised
+        data['shorts'] = clips
+        with open(json_files[0], 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as exc:
+        print(f"⚠️ Failed to update metadata.json after watermarking: {exc}")
+
+    _archive_clip_edit_bg(req.job_id, req.clip_index, final_name)
+
+    return {
+        "success": True,
+        "new_video_url": video_url,
+        "watermark": normalised,
+        "recaptioned": final_name != marked_name,
+        "caption_error": caption_error,
+        **{k: v for k, v in report.items() if k not in ("output", "mark")},
+    }
+
+
+@app.post("/api/watermark/remove")
+async def remove_watermark(req: RemoveSubtitlesRequest, request: Request):
+    """Point a clip back at its unmarked original.
+
+    No re-encode, because the mark pass always keeps the clean file beside the
+    derived one. Same shape as /api/subtitle/remove and /api/annotations/remove.
+    """
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    filename = os.path.basename(
+        req.input_filename
+        or (clips[req.clip_index].get('video_url') or '').split('/')[-1])
+    clean = _strip_mark(output_dir, _strip_burned_captions(
+        output_dir, filename))
+    if not os.path.exists(os.path.join(output_dir, clean)):
+        raise HTTPException(status_code=404,
+                            detail=f"Original not found: {clean}")
+
+    final = clean
+    captioned = _reapply_captions(req.job_id, req.clip_index,
+                                  os.path.join(output_dir, clean))
+    if captioned:
+        final = os.path.basename(captioned)
+
+    video_url = f"/videos/{req.job_id}/{final}"
+    clips[req.clip_index]['video_url'] = video_url
+    clips[req.clip_index]['watermark'] = None
+    data['shorts'] = clips
+    try:
+        with open(json_files[0], 'w') as f:
+            json.dump(data, f, indent=4)
+    except OSError as exc:
+        print(f"⚠️ Failed to update metadata.json after removing the "
+              f"watermark: {exc}")
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    if req.clip_index < len(mem_clips):
+        mem_clips[req.clip_index]['video_url'] = video_url
+        mem_clips[req.clip_index]['watermark'] = None
 
     return {"success": True, "new_video_url": video_url}
 
