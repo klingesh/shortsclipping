@@ -12,6 +12,7 @@ import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import ClipEditor from './components/ClipEditor';
 import ReframeEditor from './components/ReframeEditor';
+import AnnotationEditor from './components/AnnotationEditor';
 import UsageMeter from './components/UsageMeter';
 import TopUpModal from './components/TopUpModal';
 import StarBanner from './components/StarBanner';
@@ -293,6 +294,7 @@ function App() {
   // Clip editor overlay: index of the clip being edited, or null.
   const [editingClip, setEditingClip] = useState(null);
   const [reframingClip, setReframingClip] = useState(null);
+  const [annotatingClip, setAnnotatingClip] = useState(null);
 
   // Silent-success "saved" states for the settings key inputs (design.md: no alert popups)
   const [elevenLabsSaved, setElevenLabsSaved] = useState(false);
@@ -423,6 +425,44 @@ function App() {
       return next;
     });
     handleClipStateChange(index, { activeLayers: null, serverVideoFile: newFile });
+  };
+
+  // Annotating is not a recut: the cut is untouched, only overlays were burned
+  // on and the captions put back on top. So this deliberately does NOT reuse
+  // handleClipRerendered — that one reads start/end/recipe off the response, and
+  // the annotate response carries none of them, so it would blank the recipe and
+  // lose the clip's edit history. Nor is active_layers reset, because the
+  // endpoint re-applies the captions itself.
+  const handleClipAnnotated = (index, data) => {
+    const newFile = (data.new_video_url || '').split('/').pop();
+    setResults((prev) => {
+      if (!prev?.clips?.[index]) return prev;
+      const clips = prev.clips.slice();
+      clips[index] = {
+        ...clips[index],
+        video_url: data.new_video_url,
+        annotations: data.annotations || [],
+      };
+      return { ...prev, clips };
+    });
+    setProjectState((prev) => {
+      if (!prev?.clips) return prev;
+      return {
+        ...prev,
+        clips: prev.clips.map((c) => (c.index === index
+          ? { ...c, server_file: newFile }
+          : c)),
+      };
+    });
+    // The durable copy is of the pre-annotation file, so it would serve the
+    // wrong picture as a fallback until the next refresh.
+    setDurableClips((prev) => {
+      if (!(index in prev)) return prev;
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+    handleClipStateChange(index, { serverVideoFile: newFile });
   };
 
   // Reopen an archived project from the History tab: the backend re-downloads
@@ -1956,6 +1996,7 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
+                          onAnnotateClip={(index) => setAnnotatingClip(index)}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
                           onStateChange={handleClipStateChange}
                           durable={durableClips[i]}
@@ -2149,6 +2190,17 @@ function App() {
           clipTitle={results.clips[reframingClip].video_title_for_youtube_short || ''}
           onClose={() => setReframingClip(null)}
           onReframed={handleClipRerendered}
+        />
+      )}
+      {annotatingClip !== null && results?.clips?.[annotatingClip] && (
+        <AnnotationEditor
+          jobId={jobId}
+          clipIndex={annotatingClip}
+          clipTitle={results.clips[annotatingClip].video_title_for_youtube_short || ''}
+          videoUrl={results.clips[annotatingClip].video_url}
+          existing={results.clips[annotatingClip].annotations || []}
+          onClose={() => setAnnotatingClip(null)}
+          onAnnotated={handleClipAnnotated}
         />
       )}
       {showLogin && <LoginModal onClose={() => setShowLogin(false)} />}
