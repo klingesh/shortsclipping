@@ -436,3 +436,44 @@ def apply_annotations(video_path, annotations, output_path, *, track=None,
                 os.remove(path)
             except OSError:
                 pass
+
+
+def remap(annotation_list, segments):
+    """Carry annotations across a cut-and-concat, like layout_ranges.remap.
+
+    ``segments`` must be in the SAME timeline as the annotation times: for the
+    fast recut path that is recut.rebase_segments(...) output, which is expressed
+    in the canonical clip's own time. Passing source-absolute segments against
+    clip-relative annotations would silently move every annotation.
+
+    An annotation is kept when its window overlaps a kept stretch, clipped to
+    that stretch, and shifted to where the stretch landed in the output. One
+    annotation spanning a cut therefore comes back as two, which is right: the
+    circle really was on screen in both halves.
+    """
+    out = []
+    offset = 0.0
+    for seg in segments or []:
+        try:
+            seg_start, seg_end = float(seg["start"]), float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if seg_end <= seg_start:
+            continue
+        for annotation in annotation_list or []:
+            try:
+                start = float(annotation["start"])
+                end = float(annotation["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            lo, hi = max(start, seg_start), min(end, seg_end)
+            if hi <= lo:
+                continue
+            moved = dict(annotation)
+            moved["start"] = round(lo - seg_start + offset, 3)
+            moved["end"] = round(hi - seg_start + offset, 3)
+            out.append(moved)
+        offset += seg_end - seg_start
+
+    out.sort(key=lambda a: (a["start"], a["end"]))
+    return out

@@ -1,0 +1,84 @@
+# Second, isolated instance — for developing alongside a production OpenShorts.
+#
+# WHY THIS FILE EXISTS
+#
+# docker-compose.yml cannot run twice on one machine. Compose derives its project
+# name from the containing DIRECTORY, and a checkout is usually called
+# "openshorts-main" whichever drive it sits on, so two clones look like the same
+# project. On top of that the base file hardcodes `container_name:`, which is
+# global, and publishes fixed host ports. Start the second clone and it does not
+# create a second stack: it takes over the first one's containers and repoints
+# them at the second clone's source, which is how a running instance gets
+# silently hijacked.
+#
+# This is a COMPLETE file rather than an override. Compose merges `ports` as a
+# list, so an override that adds 8010 can end up publishing 8000 as well and
+# collide anyway. Duplicating the service definitions is the boring, predictable
+# option.
+#
+# USAGE (note the project name, which keeps volumes and networks separate too):
+#
+#   docker compose -p shortsedit -f docker-compose.dev.yml up -d
+#   docker compose -p shortsedit -f docker-compose.dev.yml exec backend sh
+#   docker compose -p shortsedit -f docker-compose.dev.yml down
+#
+#   Dashboard  http://localhost:5185
+#   API        http://localhost:8010
+#   Renderer   http://localhost:3110
+#
+# The default stack keeps 5175 / 8000 / 3100, so both run at once.
+#
+# SERVICE names stay backend/frontend/renderer on purpose: the dashboard's Vite
+# proxy targets http://backend:8000 and http://renderer:3100, and the backend
+# reaches the renderer at http://renderer:3100. Those resolve inside the Compose
+# network, so only the host-side ports differ.
+#
+# `image:` is pinned to the images the default stack already built, so this needs
+# no rebuild. Application code arrives through the bind mount, so the image only
+# supplies dependencies. Drop the image: lines to build fresh ones instead.
+
+services:
+  backend:
+    build: .
+    image: openshorts-main-backend:latest
+    container_name: shortsedit-backend
+    ports:
+      - "8010:8000"
+    volumes:
+      - .:/app
+      - /app/__pycache__
+      - ./output:/app/output
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./dashboard
+      target: dev
+    image: openshorts-main-frontend:latest
+    container_name: shortsedit-frontend
+    ports:
+      - "5185:5173"
+    volumes:
+      - ./dashboard:/app
+      - /app/node_modules
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  renderer:
+    build:
+      context: .
+      dockerfile: render-service/Dockerfile
+    image: openshorts-main-renderer:latest
+    container_name: shortsedit-renderer
+    ports:
+      - "3110:3100"
+    volumes:
+      - ./output:/output
+    environment:
+      - REMOTION_BUNDLE_PATH=/app/remotion
+      - OUTPUT_DIR=/output
+      - PORT=3100
+    restart: unless-stopped
+    depends_on:
+      - backend

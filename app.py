@@ -34,6 +34,8 @@ import layout_ranges
 import caption_presets
 import tts_backends
 import voiceover
+import annotations
+import subject_track
 
 load_dotenv()
 
@@ -495,11 +497,12 @@ def _canonical_clip_file(output_dir, base_name, index):
                    + glob.glob(os.path.join(output_dir, f"recut_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hooked_*_{clean}"))
                    + glob.glob(os.path.join(output_dir, f"hook_{clean}"))
-                   # voiced_ is the script-driven voiceover pass. It needs its
-                   # own entry for the uncaptioned case; a recaptioned one
-                   # already matches subtitled_*_ above, the same way captioned
-                   # recuts do.
-                   + glob.glob(os.path.join(output_dir, f"voiced_*_{clean}")))
+                   # voiced_ is the script-driven voiceover pass, annotated_ the
+                   # circle/arrow overlay pass. Each needs its own entry for the
+                   # uncaptioned case; a recaptioned one already matches
+                   # subtitled_*_ above, the same way captioned recuts do.
+                   + glob.glob(os.path.join(output_dir, f"voiced_*_{clean}"))
+                   + glob.glob(os.path.join(output_dir, f"annotated_*_{clean}")))
     except Exception:
         derived = []
     if not derived:
@@ -561,6 +564,19 @@ def _strip_burned_captions(output_dir, filename):
     """
     while True:
         m = re.match(r'^subtitled_\d+_(.+)$', filename)
+        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
+            return filename
+        filename = m.group(1)
+
+
+def _strip_annotations(output_dir, filename):
+    """Walk ``annotated_<ts>_`` prefixes back to the un-annotated file.
+
+    Re-annotating has to replace the overlays, not stack a second set on top of
+    the first — the same reason _strip_burned_captions exists.
+    """
+    while True:
+        m = re.match(r'^annotated_\d+_(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
             return filename
         filename = m.group(1)
@@ -3640,6 +3656,29 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
                    # path, which never reframes): captions follow them.
                    'layout_ranges': layout_ranges.read(
                        os.path.join(output_dir, _clean_recut_name))}
+        # Annotations are stored in CLIP-relative time, so a changed cut moves
+        # them. On the fast path the rebased segments are expressed in the
+        # canonical clip's own timeline — the same timeline the annotations use —
+        # so they can be remapped exactly. On the source path the clip is rebuilt
+        # from source and there is no verified clip->source->clip mapping, so
+        # they are cleared rather than silently placed on the wrong moments,
+        # which is how crop_overrides is handled just below.
+        existing_annotations = clip.get('annotations') or []
+        if existing_annotations:
+            if fast:
+                updates['annotations'] = annotations.remap(
+                    existing_annotations,
+                    recut.rebase_segments(segments, canonical_range['start'],
+                                          canonical_range['end']))
+            else:
+                updates['annotations'] = None
+        # The clip was re-rendered, so any tracking sidecar describes frames that
+        # no longer line up. Drop it; the next annotation request re-tracks.
+        try:
+            os.remove(subject_track.sidecar_path(
+                os.path.join(output_dir, _clean_recut_name)))
+        except OSError:
+            pass
         # Per-scene manual framing is keyed by scene indices of a specific cut;
         # this render neither applied it nor can it survive a changed cut, so
         # clear it rather than let /scenes serve stale overrides against the
@@ -4622,6 +4661,277 @@ async def add_voiceover(req: VoiceoverRequest, request: Request):
         "caption_error": caption_error,
         **{k: v for k, v in report.items() if k != "output"},
     }
+
+
+class AnnotationIn(BaseModel):
+    """One circle or arrow. Times are CLIP-relative seconds; positions and sizes
+    are fractions of the frame, matching the crop_overrides convention so the
+    same numbers survive a re-encode at another resolution."""
+    type: str
+    start: float = 0.0
+    end: float = 1.5
+    size: float = annotations.DEFAULT_SIZE
+    color: str = annotations.DEFAULT_COLOR
+    thickness: float = annotations.DEFAULT_THICKNESS
+    rotation: float = 0.0
+    x: float = 0.5
+    y: float = 0.5
+    # Keypoint to follow (e.g. "mouth"). None pins it at x/y.
+    track: Optional[str] = None
+    offset: Optional[List[float]] = None
+
+
+class AnnotationRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    annotations: List[AnnotationIn]
+    # Re-burn captions afterwards. Captions must stay the last layer, so the
+    # overlays go onto the clean file and captions go back on top.
+    recaption: bool = True
+    input_filename: Optional[str] = None
+
+
+@app.get("/api/clip/{job_id}/{clip_index}/track")
+async def get_clip_track(job_id: str, clip_index: int, request: Request,
+                         refresh: bool = False):
+    """Face positions across the clip, for anchoring annotations.
+
+    Cached as a sidecar next to the clip, because tracking costs a detection
+    pass. The editor needs this to offer "follow the mouth" and to draw where the
+    subject is.
+    """
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    filename = os.path.basename(
+        (clips[clip_index].get('video_url') or '').split('/')[-1])
+    if not filename:
+        base = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        filename = f"{base}_clip_{clip_index + 1}.mp4"
+    # Track the file the user is actually looking at, overlays and captions
+    # included: the coordinates only mean anything against those exact frames.
+    clip_path = os.path.join(output_dir, filename)
+    if not os.path.exists(clip_path):
+        raise HTTPException(status_code=404, detail=f"Clip file not found: {filename}")
+
+    payload = None if refresh else subject_track.read(clip_path)
+    if payload is None:
+        loop = asyncio.get_event_loop()
+        try:
+            payload = await loop.run_in_executor(
+                None, lambda: subject_track.track_clip(clip_path))
+        except subject_track.TrackingUnavailable as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        subject_track.write(clip_path, payload)
+
+    return {
+        "keypoints": list(subject_track.KEYPOINTS),
+        "coverage": payload.get("coverage"),
+        "duration": payload.get("duration"),
+        "width": payload.get("width"),
+        "height": payload.get("height"),
+        "samples": payload.get("samples"),
+    }
+
+
+@app.post("/api/annotations")
+async def add_annotations(req: AnnotationRequest, request: Request):
+    """Burn circles and arrows onto a clip.
+
+    Annotations that name a ``track`` keypoint follow the subject; the rest sit
+    at their fixed x/y. The list is stored on the clip so the editor can reload
+    and edit it, and so a fast recut can remap it.
+    """
+    await require_managed_entitlement(request)
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    if not req.annotations:
+        raise HTTPException(status_code=400, detail="No annotations supplied.")
+    if len(req.annotations) > 20:
+        # A short with twenty overlays is a mistake, and each one is an extra
+        # ffmpeg input plus a PNG.
+        raise HTTPException(status_code=400,
+                            detail="Too many annotations (max 20).")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip_data = clips[req.clip_index]
+
+    filename = os.path.basename(
+        req.input_filename
+        or (clip_data.get('video_url') or '').split('/')[-1])
+    if not filename:
+        base = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        filename = f"{base}_clip_{req.clip_index + 1}.mp4"
+
+    # Overlays go on the clean picture: captions must stay the last layer, and
+    # re-annotating must replace the old overlays rather than stack on them.
+    filename = _strip_burned_captions(output_dir, filename)
+    filename = _strip_annotations(output_dir, filename)
+    input_path = os.path.join(output_dir, filename)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404,
+                            detail=f"Video file not found: {filename}")
+
+    raw = [a.model_dump(exclude_none=True) for a in req.annotations]
+    try:
+        normalised = annotations.normalise_annotations(raw)
+    except annotations.AnnotationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    loop = asyncio.get_event_loop()
+    track = None
+    if any(a["track"] for a in normalised):
+        track = subject_track.read(input_path)
+        if track is None:
+            try:
+                track = await loop.run_in_executor(
+                    None, lambda: subject_track.track_clip(input_path))
+                subject_track.write(input_path, track)
+            except subject_track.TrackingUnavailable as exc:
+                # Tracking is a nicety; a fixed-position overlay is still worth
+                # delivering, so fall back rather than fail the request.
+                print(f"⚠️ Annotation tracking unavailable ({exc}) — "
+                      f"falling back to fixed positions.")
+                track = None
+
+    generation_id = int(time.time())
+    annotated_name = f"annotated_{generation_id}_{filename}"
+    annotated_path = os.path.join(output_dir, annotated_name)
+
+    try:
+        report = await loop.run_in_executor(
+            None,
+            lambda: annotations.apply_annotations(
+                input_path, normalised, annotated_path,
+                track=track, workdir=output_dir))
+    except annotations.AnnotationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    final_name = annotated_name
+    caption_error = None
+    if req.recaption:
+        try:
+            captioned = await loop.run_in_executor(
+                None,
+                lambda: _reapply_captions(req.job_id, req.clip_index,
+                                          annotated_path))
+            if captioned:
+                final_name = os.path.basename(captioned)
+        except Exception as exc:
+            caption_error = f"{type(exc).__name__}: {exc}"
+            print(f"⚠️ Annotation captions failed ({caption_error}) — "
+                  f"delivering the annotated clip without them.")
+
+    video_url = f"/videos/{req.job_id}/{final_name}"
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    if req.clip_index < len(mem_clips):
+        mem_clips[req.clip_index]['video_url'] = video_url
+        mem_clips[req.clip_index]['annotations'] = normalised
+    try:
+        # Stored as a sibling of `recipe`, not inside it: both the rerender and
+        # the reframe path build a brand new recipe dict, so anything kept in
+        # there would be silently dropped on the next edit.
+        clip_data['video_url'] = video_url
+        clip_data['annotations'] = normalised
+        data['shorts'] = clips
+        with open(json_files[0], 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as exc:
+        print(f"⚠️ Failed to update metadata.json after annotating: {exc}")
+
+    _archive_clip_edit_bg(req.job_id, req.clip_index, final_name)
+
+    return {
+        "success": True,
+        "new_video_url": video_url,
+        "annotations": normalised,
+        "tracked": bool(track),
+        "recaptioned": final_name != annotated_name,
+        "caption_error": caption_error,
+        **{k: v for k, v in report.items() if k != "output"},
+    }
+
+
+@app.post("/api/annotations/remove")
+async def remove_annotations(req: RemoveSubtitlesRequest, request: Request):
+    """Point a clip back at its un-annotated original.
+
+    No re-encode: the annotation pass always keeps the clean file next to the
+    derived one, so removing is choosing the other file, exactly like
+    /api/subtitle/remove.
+    """
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    filename = os.path.basename(
+        req.input_filename
+        or (clips[req.clip_index].get('video_url') or '').split('/')[-1])
+    # Strip captions first so an annotated+captioned clip resolves, then put
+    # captions back on the clean picture.
+    clean = _strip_annotations(output_dir, _strip_burned_captions(
+        output_dir, filename))
+    if not os.path.exists(os.path.join(output_dir, clean)):
+        raise HTTPException(status_code=404,
+                            detail=f"Original not found: {clean}")
+
+    final = clean
+    captioned = _reapply_captions(req.job_id, req.clip_index,
+                                  os.path.join(output_dir, clean))
+    if captioned:
+        final = os.path.basename(captioned)
+
+    video_url = f"/videos/{req.job_id}/{final}"
+    clips[req.clip_index]['video_url'] = video_url
+    clips[req.clip_index]['annotations'] = None
+    data['shorts'] = clips
+    try:
+        with open(json_files[0], 'w') as f:
+            json.dump(data, f, indent=4)
+    except OSError as exc:
+        print(f"⚠️ Failed to update metadata.json after removing annotations: {exc}")
+    mem_clips = (job.get('result') or {}).get('clips') or []
+    if req.clip_index < len(mem_clips):
+        mem_clips[req.clip_index]['video_url'] = video_url
+        mem_clips[req.clip_index]['annotations'] = None
+
+    return {"success": True, "new_video_url": video_url}
 
 
 @app.post("/api/subtitle/remove")
